@@ -32,6 +32,13 @@ _ACCOUNT_OBJECT = "Account"
 
 # Max time to wait for a checkpoint code from the frontend (seconds).
 _CHECKPOINT_TIMEOUT_SECONDS = 300
+
+
+class AccountLinkError(Exception):
+    """Raised when an account cannot be queued for linking."""
+    pass
+
+
 # Poll interval while waiting for a checkpoint code.
 _CHECKPOINT_POLL_INTERVAL = 2
 
@@ -66,24 +73,56 @@ def queue_link_account(db: Session, payload: dict) -> UoAccount:
     A new `link_attempt_id` is generated each time the user starts a link so
     that a stale background task from a previous attempt cannot overwrite the
     result of the current one.
+
+    If the frontend provides `account_id`, the existing account is reused. This
+    prevents duplicate rows when the same LinkedIn account is reconnected.
     """
-    account = get_or_create_account(
-        db,
-        organisation_code=payload["organisation_code"],
-        email=payload["email"],
-        password=payload.get("password"),
-        country_code=payload.get("country_code", ""),
-        timezone=payload.get("timezone", "UTC"),
-        working_hours_start=payload.get("working_hours_start", 9),
-        working_hours_end=payload.get("working_hours_end", 18),
-        working_days=payload.get("working_days", [0, 1, 2, 3, 4]),
-        daily_connect_limit=payload.get("daily_connect_limit", 25),
-        min_delay_seconds=payload.get("min_delay_seconds", 180),
-        max_delay_seconds=payload.get("max_delay_seconds", 600),
-        status=AccountStatus.PENDING,
-        last_error=None,
-        link_attempt_id=str(uuid.uuid4()),
-    )
+    organisation_code = payload["organisation_code"]
+    account_id = payload.get("account_id")
+    email = payload.get("email")
+
+    if account_id:
+        account = (
+            db.query(UoAccount)
+            .filter(UoAccount.id == account_id, UoAccount.organisation_code == organisation_code)
+            .first()
+        )
+        if not account:
+            raise AccountLinkError("account_id not found in this organisation")
+    elif email:
+        account = get_or_create_account(
+            db,
+            organisation_code=organisation_code,
+            email=email,
+        )
+    else:
+        raise AccountLinkError("Either email or account_id must be provided")
+
+    # Reset transient state for the link attempt.
+    account.password = payload.get("password")
+    account.country_code = payload.get("country_code", "") or account.country_code
+    if account_id:
+        # Allow the reconnect payload to update schedule/limit overrides.
+        account.timezone = payload.get("timezone") or account.timezone
+        account.working_hours_start = payload.get("working_hours_start", account.working_hours_start)
+        account.working_hours_end = payload.get("working_hours_end", account.working_hours_end)
+        account.working_days = payload.get("working_days") or account.working_days
+        account.daily_connect_limit = payload.get("daily_connect_limit", account.daily_connect_limit)
+        account.min_delay_seconds = payload.get("min_delay_seconds", account.min_delay_seconds)
+        account.max_delay_seconds = payload.get("max_delay_seconds", account.max_delay_seconds)
+    else:
+        account.timezone = payload.get("timezone", "UTC")
+        account.working_hours_start = payload.get("working_hours_start", 9)
+        account.working_hours_end = payload.get("working_hours_end", 18)
+        account.working_days = payload.get("working_days", [0, 1, 2, 3, 4])
+        account.daily_connect_limit = payload.get("daily_connect_limit", 25)
+        account.min_delay_seconds = payload.get("min_delay_seconds", 180)
+        account.max_delay_seconds = payload.get("max_delay_seconds", 600)
+
+    account.status = AccountStatus.PENDING
+    account.last_error = None
+    account.link_attempt_id = str(uuid.uuid4())
+
     # Intents from a previous attempt are no longer relevant; mark them stale so
     # the old background task exits cleanly instead of waiting for a code forever.
     (

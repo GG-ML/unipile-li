@@ -117,6 +117,21 @@ class UoAccount(Base):
     __table_args__ = (
         UniqueConstraint("organisation_code", "email", name="uq_uo_account_org_email"),
         Index("idx_uo_account_status", "status"),
+        # Prevent the same LinkedIn account from being linked twice under different rows.
+        Index(
+            "uq_uo_account_org_unipile",
+            "organisation_code",
+            "unipile_account_id",
+            unique=True,
+            postgresql_where=unipile_account_id.is_not(None),
+        ),
+        Index(
+            "uq_uo_account_org_provider",
+            "organisation_code",
+            "provider_id",
+            unique=True,
+            postgresql_where=provider_id.is_not(None),
+        ),
     )
 
 

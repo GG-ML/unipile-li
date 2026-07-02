@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -13,7 +13,8 @@ from pydantic import BaseModel, Field
 # ---------------------------------------------------------------------------
 class AccountConnectRequest(BaseModel):
     organisation_code: str = Field(..., description="Owner organisation code")
-    email: str = Field(..., description="LinkedIn login email/username")
+    email: Optional[str] = Field(None, description="LinkedIn login email/username (required when creating a new account)")
+    account_id: Optional[int] = Field(None, description="Existing account ID to reconnect (prevents duplicate rows)")
     password: str = Field(..., description="LinkedIn password")
     country_code: str = Field("", description="Proxy country code e.g. IN, US, GB")
 
@@ -25,6 +26,13 @@ class AccountConnectRequest(BaseModel):
     daily_connect_limit: Optional[int] = None
     min_delay_seconds: Optional[int] = None
     max_delay_seconds: Optional[int] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _require_email_or_account_id(cls, values: dict) -> dict:
+        if not values.get("email") and not values.get("account_id"):
+            raise ValueError("Either email or account_id must be provided")
+        return values
 
 
 class CheckpointRequest(BaseModel):

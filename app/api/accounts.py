@@ -44,7 +44,10 @@ async def connect_account(
     GET /api/accounts/{account_id}/status for progress and submit any checkpoint
     codes via POST /api/accounts/{account_id}/checkpoint.
     """
-    account = account_service.queue_link_account(db, payload.model_dump())
+    try:
+        account = account_service.queue_link_account(db, payload.model_dump())
+    except account_service.AccountLinkError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     background_tasks.add_task(account_service.process_link_account, account.id)
     return {
         "status": "started",
