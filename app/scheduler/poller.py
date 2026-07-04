@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from app.config import settings
 from app.db.database import session_scope
@@ -34,6 +34,8 @@ from app.services.template_service import build_context, render
 from app.unipile.client import UnipileClient, UnipileError
 
 logger = logging.getLogger(__name__)
+
+FIRST_DEGREE = "FIRST_DEGREE"
 
 MESSAGE_MAX_LEN = 1000
 _executor = ThreadPoolExecutor(max_workers=settings.MAX_CONCURRENT_WORKERS)
@@ -109,6 +111,19 @@ def _poll_account(account_id: int) -> bool:
                 task.status = TaskStatus.ACCEPTED
                 task.accepted_at = now
                 db_log("info", "invite.accepted", account_id=account.id, task_id=task.id)
+                continue
+
+            # Fallback: the connection may be old and not appear in the recent
+            # relations list. If the scraped profile says FIRST_DEGREE, treat it
+            # as accepted so the initial message can be sent.
+            try:
+                if ensure_task_profile(db, task, unipile_id, client) and task.network_distance == FIRST_DEGREE:
+                    task.status = TaskStatus.ACCEPTED
+                    task.accepted_at = now
+                    db_log("info", "invite.accepted_from_profile", account_id=account.id, task_id=task.id,
+                           data={"connected_at": task.connected_at.isoformat() if task.connected_at else None})
+            except Exception:
+                logger.exception("Profile check failed for INVITE_SENT task %s", task.id)
 
         # --- 2. Send initial message to accepted (no message yet) ----------
         accepted_tasks = (
@@ -250,14 +265,32 @@ def _handle_replies_and_followups(db, account: UoAccount, task: UoTask,
 
 
 def _check_for_reply(client: UnipileClient, task: UoTask) -> bool:
-    """Return True if the target sent an inbound message after our last outbound."""
-    if not task.chat_id:
+    """Return True if the target sent an inbound message after our initial message."""
+    if not task.chat_id or not task.initial_sent_at:
+        # We haven't sent an initial message yet, so nothing counts as a reply.
         return False
     try:
         messages = client.get_chat_messages(task.chat_id, limit=20)
     except UnipileError:
         return False
+
+    initial_sent_at = task.initial_sent_at
+    if initial_sent_at.tzinfo is None:
+        initial_sent_at = initial_sent_at.replace(tzinfo=timezone.utc)
+
     for msg in messages:
+        ts = msg.get("timestamp") or msg.get("created_at") or msg.get("date")
+        if not ts:
+            continue
+        try:
+            msg_at = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except Exception:
+            continue
+
+        # Only consider messages that arrived after our initial message.
+        if msg_at <= initial_sent_at:
+            continue
+
         is_sender = msg.get("is_sender")
         # is_sender is True for messages we sent; an inbound message has it False.
         if is_sender is False:

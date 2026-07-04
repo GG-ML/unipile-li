@@ -26,6 +26,7 @@ from app.unipile.client import UnipileClient, UnipileError
 logger = logging.getLogger(__name__)
 
 NOTE_MAX_LEN = 300
+FIRST_DEGREE = "FIRST_DEGREE"
 
 _executor = ThreadPoolExecutor(max_workers=settings.MAX_CONCURRENT_WORKERS)
 
@@ -106,6 +107,18 @@ def _send_one_invite(account_id: int) -> bool:
             task.last_error = "missing provider_id after profile fetch"
             db_log("error", "invite.no_provider_id", account_id=account.id, task_id=task.id)
             return False
+
+        # Edge case: the target is already a 1st-degree connection. LinkedIn/Unipile
+        # still return a 200 invitation response, which would leave the task stuck in
+        # INVITE_SENT. Skip the invite and move straight to accepted so the poller
+        # can send the initial message and follow-ups.
+        if task.network_distance == FIRST_DEGREE:
+            task.status = TaskStatus.ACCEPTED
+            task.accepted_at = now
+            task.scheduled_at = None
+            db_log("info", "invite.already_connected", account_id=account.id, task_id=task.id,
+                   data={"connected_at": task.connected_at.isoformat() if task.connected_at else None})
+            return True
 
         # Render note from template only for paid LinkedIn accounts. Basic (free)
         # accounts are limited to 200-character notes and can quickly hit the

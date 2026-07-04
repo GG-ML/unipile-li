@@ -35,6 +35,14 @@ def _extract_fields(profile: dict) -> dict:
         first_exp = experience[0] or {}
         company = first_exp.get("company") or first_exp.get("company_name") or ""
 
+    connected_at_ms = profile.get("connected_at")
+    connected_at = None
+    if connected_at_ms:
+        try:
+            connected_at = datetime.utcfromtimestamp(int(connected_at_ms) / 1000)
+        except Exception:
+            connected_at = None
+
     return {
         "first_name": first,
         "last_name": last,
@@ -44,6 +52,8 @@ def _extract_fields(profile: dict) -> dict:
         "location": (location or "").strip(),
         "provider_id": profile.get("provider_id") or "",
         "public_identifier": profile.get("public_identifier") or "",
+        "network_distance": (profile.get("network_distance") or "").strip(),
+        "connected_at": connected_at,
     }
 
 
@@ -61,9 +71,11 @@ def upsert_profile(db: Session, fields: dict, raw: dict) -> UoProfile:
     public_id = fields.get("public_identifier")
     existing = get_cached_profile(db, public_id) if public_id else None
     if existing:
-        for key in ("first_name", "last_name", "full_name", "headline", "company", "location", "provider_id"):
+        for key in ("first_name", "last_name", "full_name", "headline", "company", "location", "provider_id", "network_distance"):
             if fields.get(key):
                 setattr(existing, key, fields[key])
+        if fields.get("connected_at"):
+            existing.connected_at = fields["connected_at"]
         existing.raw_json = raw
         existing.updated_at = datetime.utcnow()
         return existing
@@ -77,6 +89,8 @@ def upsert_profile(db: Session, fields: dict, raw: dict) -> UoProfile:
         headline=fields.get("headline"),
         company=fields.get("company"),
         location=fields.get("location"),
+        network_distance=fields.get("network_distance"),
+        connected_at=fields.get("connected_at"),
         raw_json=raw,
     )
     db.add(profile)
@@ -89,19 +103,22 @@ def ensure_task_profile(
     unipile_account_id: str,
     client: UnipileClient | None = None,
 ) -> bool:
-    """Ensure `task` has first_name/provider_id, scraping via Unipile if needed.
+    """Ensure `task` has first_name/provider_id and network_distance, scraping via Unipile if needed.
 
     Returns True if the task has a usable provider_id after this call.
     """
-    # 1. Already have what we need on the task?
-    if (task.first_name or "").strip() and (task.provider_id or "").strip():
+    # 1. Already have everything on the task?
+    if (task.first_name or "").strip() and (task.provider_id or "").strip() and (task.network_distance or "").strip():
         return True
 
     # 2. Try DB profile cache.
     cached = get_cached_profile(db, task.public_identifier)
     if cached and (cached.first_name or "").strip() and (cached.provider_id or "").strip():
         _apply_to_task(task, cached)
-        return True
+        # If we still don't know the distance, fall through to scrape so we can
+        # detect 1st-degree connections in the executor/poller.
+        if (task.network_distance or "").strip():
+            return True
 
     # 3. Scrape via Unipile.
     identifier = task.public_identifier or task.provider_id
@@ -138,3 +155,7 @@ def _apply_to_task(task: UoTask, profile: UoProfile) -> None:
         task.location = profile.location
     if profile.provider_id and not (task.provider_id or "").strip():
         task.provider_id = profile.provider_id
+    if profile.network_distance:
+        task.network_distance = profile.network_distance
+    if profile.connected_at:
+        task.connected_at = profile.connected_at

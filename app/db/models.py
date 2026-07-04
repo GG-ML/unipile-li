@@ -231,6 +231,8 @@ class UoTask(Base):
     headline = Column(Text)
     company = Column(String(255))
     location = Column(String(255))
+    network_distance = Column(String(50))  # FIRST_DEGREE, SECOND_DEGREE, etc.
+    connected_at = Column(DateTime)      # populated by Unipile for 1st-degree connections
 
     status = Column(String(50), default=TaskStatus.PENDING, index=True)
 
@@ -288,6 +290,8 @@ class UoProfile(Base):
     headline = Column(Text)
     company = Column(String(255))
     location = Column(String(255))
+    network_distance = Column(String(50))  # FIRST_DEGREE, SECOND_DEGREE, etc.
+    connected_at = Column(DateTime)        # populated by Unipile for 1st-degree connections
     raw_json = Column(JSONB)
     scraped_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
