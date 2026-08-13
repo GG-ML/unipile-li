@@ -20,6 +20,7 @@ from app.config import settings
 from app.db.database import session_scope
 from app.db.models import (
     AccountStatus,
+    CampaignStatus,
     TaskStatus,
     UoAccount,
     UoCampaign,
@@ -103,7 +104,9 @@ def _poll_account(account_id: int) -> bool:
 
         invite_sent_tasks = (
             db.query(UoTask)
+            .join(UoCampaign, UoCampaign.id == UoTask.campaign_id)
             .filter(UoTask.account_id == account.id, UoTask.status == TaskStatus.INVITE_SENT)
+            .filter(UoCampaign.status == CampaignStatus.RUNNING)
             .all()
         )
         for task in invite_sent_tasks:
@@ -128,7 +131,9 @@ def _poll_account(account_id: int) -> bool:
         # --- 2. Send initial message to accepted (no message yet) ----------
         accepted_tasks = (
             db.query(UoTask)
+            .join(UoCampaign, UoCampaign.id == UoTask.campaign_id)
             .filter(UoTask.account_id == account.id, UoTask.status == TaskStatus.ACCEPTED)
+            .filter(UoCampaign.status == CampaignStatus.RUNNING)
             .all()
         )
         for task in accepted_tasks:
@@ -137,9 +142,11 @@ def _poll_account(account_id: int) -> bool:
         # --- 3 & 4. Reply detection + follow-ups ---------------------------
         active_tasks = (
             db.query(UoTask)
+            .join(UoCampaign, UoCampaign.id == UoTask.campaign_id)
             .filter(
                 UoTask.account_id == account.id,
                 UoTask.status.in_([TaskStatus.INITIAL_SENT]),
+                UoCampaign.status == CampaignStatus.RUNNING,
             )
             .all()
         )
@@ -179,13 +186,27 @@ def _fetch_connected_provider_ids(client: UnipileClient, unipile_id: str, max_pa
 
 def _send_initial_message(db, account: UoAccount, task: UoTask, client: UnipileClient) -> None:
     campaign = db.query(UoCampaign).filter(UoCampaign.id == task.campaign_id).first()
-    if not campaign or not campaign.initial_message_template:
+    if not campaign or campaign.status != CampaignStatus.RUNNING:
+        return
+    if not campaign.initial_message_template:
         # No initial message configured — consider the task complete on acceptance.
         task.status = TaskStatus.COMPLETED
         return
 
     # Ensure we have a first name before personalising.
     ensure_task_profile(db, task, account.unipile_account_id, client)
+    # A cached chat can be messaged without a profile provider ID. For a new
+    # chat, however, never call Unipile with a missing recipient identifier;
+    # leave the task accepted so a later poll can resolve the profile safely.
+    if not task.chat_id and not (task.provider_id or "").strip():
+        task.last_error = "initial message deferred: missing provider_id after profile fetch"
+        db_log(
+            "warning",
+            "initial.provider_id_deferred",
+            account_id=account.id,
+            task_id=task.id,
+        )
+        return
     text = render(campaign.initial_message_template, build_context(task), MESSAGE_MAX_LEN)
     if not text:
         return
@@ -216,6 +237,16 @@ def _handle_replies_and_followups(db, account: UoAccount, task: UoTask,
                                   client: UnipileClient, now: datetime) -> None:
     campaign = db.query(UoCampaign).filter(UoCampaign.id == task.campaign_id).first()
 
+    if not campaign or campaign.status != CampaignStatus.RUNNING:
+        return
+
+    # If a reply was already received, don't send follow-ups.
+    if task.reply_received:
+        if task.status != TaskStatus.REPLIED:
+            task.status = TaskStatus.REPLIED
+            db_log("info", "reply.already_received", account_id=account.id, task_id=task.id)
+        return
+
     # Detect replies first.
     replied = _check_for_reply(client, task)
     if replied:
@@ -226,7 +257,7 @@ def _handle_replies_and_followups(db, account: UoAccount, task: UoTask,
         return
 
     # No reply -> send follow-up if enabled and due.
-    if not campaign or not campaign.followup_enabled:
+    if not campaign.followup_enabled:
         return
     templates = campaign.followup_templates or []
     sent = task.followup_count or 0
@@ -274,26 +305,13 @@ def _check_for_reply(client: UnipileClient, task: UoTask) -> bool:
     except UnipileError:
         return False
 
-    initial_sent_at = task.initial_sent_at
-    if initial_sent_at.tzinfo is None:
-        initial_sent_at = initial_sent_at.replace(tzinfo=timezone.utc)
-
     for msg in messages:
-        ts = msg.get("timestamp") or msg.get("created_at") or msg.get("date")
-        if not ts:
-            continue
-        try:
-            msg_at = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        except Exception:
-            continue
-
-        # Only consider messages that arrived after our initial message.
-        if msg_at <= initial_sent_at:
-            continue
-
         is_sender = msg.get("is_sender")
-        # is_sender is True for messages we sent; an inbound message has it False.
-        if is_sender is False:
+        # Any inbound message in the conversation is a hard stop. LinkedIn can
+        # return conversation history with timestamps that predate our local
+        # initial_sent_at (timezone/session migration), and sending a follow-up
+        # in that case is unsafe.
+        if is_sender is False or is_sender in (0, "0", "false", "False"):
             return True
         # Fallback: explicit direction fields.
         if msg.get("direction") == "inbound" or msg.get("from_me") is False:
